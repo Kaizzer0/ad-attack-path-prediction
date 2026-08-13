@@ -204,6 +204,39 @@ def get_shortest_path_details(driver, node_ids: List[str]) -> List[Dict[str, Any
     return results
 
 
+def render_find_path_result_dialog() -> None:
+    """Hiển thị kết quả Find Path trong Dialog/Modal để tránh chiếm sidebar."""
+    result = st.session_state.get("find_path_dialog_result")
+    if not result:
+        return
+
+    @st.dialog("Find Path Result")
+    def _dialog() -> None:
+        status = result.get("status")
+        title = result.get("title", "Kết quả Find Path")
+        message = result.get("message", "")
+        details = result.get("details", [])
+
+        st.subheader(title)
+        if status == "success":
+            st.success(message)
+        elif status == "warning":
+            st.warning(message)
+        else:
+            st.error(message)
+
+        for line in details:
+            st.write(line)
+
+        st.divider()
+        if st.button("Đóng", type="primary", key="close_find_path_dialog"):
+            st.session_state.find_path_dialog_open = False
+            st.session_state.find_path_dialog_result = None
+            st.rerun()
+
+    _dialog()
+
+
 def visualize_graph_with_pyvis(
     edges_data: List[Dict],
     highlighted_path: List[str] | None = None,
@@ -666,6 +699,10 @@ def main() -> None:
         st.session_state.show_edge_ops = False
     if "show_dijkstra" not in st.session_state:
         st.session_state.show_dijkstra = False
+    if "find_path_dialog_open" not in st.session_state:
+        st.session_state.find_path_dialog_open = False
+    if "find_path_dialog_result" not in st.session_state:
+        st.session_state.find_path_dialog_result = None
     if "show_import_dialog" not in st.session_state:
         st.session_state.show_import_dialog = False
 
@@ -852,17 +889,40 @@ def main() -> None:
                             path, total_cost = dijkstra_shortest_path(driver, source, target)
                             if path:
                                 st.session_state.highlighted_path = path
+                                dialog_details = [
+                                    f"Source Node ID: {source}",
+                                    f"Target Node ID: {target}",
+                                    f"Số node trên path: {len(path)}",
+                                ]
                                 if total_cost is not None:
-                                    st.success(
-                                        f"Path found: {' → '.join(path)}\n\n"
-                                        f"Tổng chi phí phát hiện (cost): {total_cost:.2f}"
-                                    )
-                                else:
-                                    st.success(f"Path found: {' → '.join(path)}")
+                                    dialog_details.append(f"Tổng chi phí phát hiện (cost): {total_cost:.2f}")
+                                st.session_state.find_path_dialog_result = {
+                                    "status": "success",
+                                    "title": "Tìm thấy đường đi",
+                                    "message": "Đã tìm thấy đường đi ít bị phát hiện nhất.",
+                                    "details": dialog_details,
+                                }
                             else:
-                                st.warning("No path found!")
+                                st.session_state.find_path_dialog_result = {
+                                    "status": "warning",
+                                    "title": "Không tìm thấy đường đi",
+                                    "message": "Không có đường đi phù hợp giữa Source và Target hiện tại.",
+                                    "details": [
+                                        f"Source Node ID: {source}",
+                                        f"Target Node ID: {target}",
+                                    ],
+                                }
+                            st.session_state.find_path_dialog_open = True
                         except Exception as e:
-                            st.error(f"Path finding failed: {e}")
+                            st.session_state.find_path_dialog_result = {
+                                "status": "error",
+                                "title": "Lỗi khi tìm đường",
+                                "message": f"Path finding failed: {e}",
+                                "details": [
+                                    "Vui lòng kiểm tra lại dữ liệu đầu vào và trạng thái kết nối Neo4j.",
+                                ],
+                            }
+                            st.session_state.find_path_dialog_open = True
             
             with col2:
                 def clear_path_action():
@@ -870,6 +930,10 @@ def main() -> None:
                     st.session_state.focus_path = False
 
                 st.button("Back (Clear)", key="clear_path_btn", on_click=clear_path_action)
+
+    # Hiển thị giao diện Form Upload kéo thả file thô SharpHound ở vùng nội dung chính khi kích hoạt
+    if st.session_state.get("find_path_dialog_open"):
+        render_find_path_result_dialog()
 
     # Hiển thị giao diện Form Upload kéo thả file thô SharpHound ở vùng nội dung chính khi kích hoạt
     if st.session_state.get("show_import_dialog"):
