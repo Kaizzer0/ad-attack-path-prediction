@@ -1,0 +1,8 @@
+# Vá bug: trước đây dự án không có requirements.txt, dependency được cài không ghim
+# version ngay trong lệnh command của docker-compose.yml, dễ vỡ khi thư viện cập nhật.
+# Các version dưới đây đã được cài đặt và kiểm thử thực tế trong quá trình sửa lỗi.
+# neo4j==5.26.0 được chọn khớp đúng với version Neo4j server (neo4j:5.26.0) trong
+# docker-compose.yml theo khuyến nghị tương thích driver-server của Neo4j.
+streamlit==1.59.2
+neo4j==5.26.0
+pyvis==0.3.2

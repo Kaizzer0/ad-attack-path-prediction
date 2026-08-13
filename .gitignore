@@ -1,0 +1,29 @@
+# Vá bug: trước đây __pycache__ bị commit kèm source, và không có quy tắc loại trừ
+# dữ liệu trung gian sinh ra trong lúc chạy ứng dụng.
+
+# Python build artifacts
+__pycache__/
+*.pyc
+*.pyo
+
+# Dữ liệu SharpHound thô người dùng tải lên và dữ liệu trung gian sinh ra khi chạy
+# pipeline (chỉ ở thư mục gốc, KHÔNG áp dụng cho dữ liệu mẫu trong thư mục data/)
+/*_users.json
+/*_computers.json
+/*_groups.json
+/*_ous.json
+/*_gpos.json
+/*_domains.json
+/nodes_clean.json
+/edges_clean.json
+shared_data/*.json
+
+# Neo4j runtime data (đã có volume riêng trong docker-compose.yml, không cần commit)
+neo4j_data/
+
+# Môi trường ảo Python nếu chạy không qua Docker
+.venv/
+venv/
+
+# File hệ điều hành
+.DS_Store
