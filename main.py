@@ -111,13 +111,30 @@ def create_node(tx, node_id: str, node_name: str, node_label: str = "User"):
     return tx.run(query, node_id=node_id, node_name=node_name).single()
 
 
-def create_edge(tx, source_id: str, target_id: str, relationship_type: str = "MemberOf"):
+def create_edge(
+    tx,
+    source_id: str,
+    target_id: str,
+    relationship_type: str = "MemberOf",
+    edge_cost: float | None = None,
+):
+    """Tạo relationship trong Neo4j và gán cost từ cost_matrix.db.
+
+    Vá bug: trước đây CREATE không gán property nào lên r, khiến r.cost = null
+    ngay từ đầu và Dijkstra không tính được chi phí cho Edge được tạo thủ công.
+    Nay cost được truyền vào và gán trực tiếp trên relationship khi CREATE.
+    """
     relationship_type = _validate_identifier(relationship_type, "Relationship type")
     query = """
     MATCH (source {id: $source_id}), (target {id: $target_id})
-    CREATE (source)-[r:%s]->(target) RETURN r
+    CREATE (source)-[r:%s {cost: $edge_cost, techniques: [], events: [], filters: []}]->(target) RETURN r
     """ % relationship_type
-    return tx.run(query, source_id=source_id, target_id=target_id).single()
+    return tx.run(
+        query,
+        source_id=source_id,
+        target_id=target_id,
+        edge_cost=edge_cost,
+    ).single()
 
 
 def update_node_name(tx, node_id: str, new_name: str):
@@ -125,13 +142,107 @@ def update_node_name(tx, node_id: str, new_name: str):
     return tx.run(query, node_id=node_id, new_name=new_name).single()
 
 
-def set_edge_techniques(tx, source_id: str, target_id: str, techniques_list: List[str], relationship_type: str = "MemberOf"):
+def set_edge_techniques(
+    tx,
+    source_id: str,
+    target_id: str,
+    techniques_list: List[str],
+    relationship_type: str = "MemberOf",
+):
+    """Cập nhật r.techniques cho relationship đã tồn tại.
+
+    Vá bug: trước đây nếu MATCH không tìm thấy relationship (ví dụ sai
+    relationship_type), hàm trả None im lặng và UI vẫn hiển thị 'Edge updated!'
+    mặc dù database không thay đổi. Nay raise ValueError rõ ràng để caller
+    có thể phân biệt 'không tìm thấy edge' với 'cập nhật thành công'.
+    """
     relationship_type = _validate_identifier(relationship_type, "Relationship type")
     query = """
     MATCH (source {id: $source_id})-[r:%s]->(target {id: $target_id})
     SET r.techniques = $techniques_list RETURN r
     """ % relationship_type
-    return tx.run(query, source_id=source_id, target_id=target_id, techniques_list=techniques_list).single()
+    result = tx.run(
+        query,
+        source_id=source_id,
+        target_id=target_id,
+        techniques_list=techniques_list,
+    ).single()
+    if result is None:
+        raise ValueError(
+            f"Edge không tìm thấy: {source_id} -[{relationship_type}]-> {target_id}"
+        )
+    return result
+
+
+def change_edge_type(
+    tx,
+    source_id: str,
+    target_id: str,
+    old_relationship_type: str,
+    new_relationship_type: str,
+    new_cost: float | None = None,
+) -> None:
+    """Đổi Relationship Type của một edge, giữ nguyên toàn bộ properties.
+
+    Neo4j không hỗ trợ thay đổi type của relationship trực tiếp.
+    Giải pháp: đọc properties hiện tại từ mọi relationship giữa 2 node,
+    xóa toàn bộ relationship cũ giữa cặp node đó, rồi tạo lại relationship mới.
+    Điều này ngăn các edge cũ còn tồn tại và khiến Dijkstra/path render sai.
+    """
+    old_relationship_type = _validate_identifier(old_relationship_type, "Old relationship type")
+    new_relationship_type = _validate_identifier(new_relationship_type, "New relationship type")
+
+    # Bước 1: Đọc thông tin từ mọi relationship giữa 2 node, không chỉ đúng type cũ.
+    read_query = """
+    MATCH (source {id: $source_id})-[r]->(target {id: $target_id})
+    RETURN collect({
+        type: type(r),
+        cost: r.cost,
+        techniques: r.techniques,
+        events: r.events,
+        filters: r.filters
+    }) AS rels
+    """
+    record = tx.run(read_query, source_id=source_id, target_id=target_id).single()
+    if record is None or not record["rels"]:
+        raise ValueError(
+            f"Edge không tìm thấy: {source_id} -[{old_relationship_type}]-> {target_id}"
+        )
+
+    rels = record["rels"]
+    matched_rel = next((rel for rel in rels if rel["type"] == old_relationship_type), rels[0])
+
+    old_cost = matched_rel.get("cost")
+    techniques = matched_rel.get("techniques") or []
+    events = matched_rel.get("events") or []
+    filters = matched_rel.get("filters") or []
+    final_cost = new_cost if new_cost is not None else old_cost
+
+    # Bước 2: Xóa toàn bộ relationship cũ giữa cặp node này, tránh để lại edge cũ.
+    delete_query = """
+    MATCH (source {id: $source_id})-[r]->(target {id: $target_id}) DELETE r
+    """
+    tx.run(delete_query, source_id=source_id, target_id=target_id)
+
+    # Bước 3: Tạo relationship mới với type mới và properties đã lưu
+    create_query = """
+    MATCH (source {id: $source_id}), (target {id: $target_id})
+    CREATE (source)-[r:%s {cost: $cost, techniques: $techniques, events: $events, filters: $filters}]->(target)
+    RETURN r
+    """ % new_relationship_type
+    result = tx.run(
+        create_query,
+        source_id=source_id,
+        target_id=target_id,
+        cost=final_cost,
+        techniques=techniques,
+        events=events,
+        filters=filters,
+    ).single()
+    if result is None:
+        raise RuntimeError(
+            f"Không thể tạo relationship mới: {source_id} -[{new_relationship_type}]-> {target_id}"
+        )
 
 
 def remove_node_attribute(tx, node_id: str, attribute_name: str = "name"):
@@ -180,26 +291,53 @@ def get_graph_preview(driver, limit: int = 300) -> Dict[str, Any]:
         return {"edges": edges, "isolated_nodes": isolated_nodes}
 
 
+def get_edge_info(driver, source_id: str, target_id: str) -> List[Dict[str, Any]]:
+    """Lấy thông tin tất cả relationships từ source đến target.
+
+    Không cần biết trước relationship type, trả về toàn bộ
+    properties (để form Update có thể hiển thị đúng thông tin hiện tại).
+    """
+    with driver.session() as session:
+        rows = session.run(
+            """
+            MATCH (s {id: $source_id})-[r]->(t {id: $target_id})
+            RETURN type(r)         AS type,
+                   r.cost          AS cost,
+                   r.techniques    AS techniques,
+                   r.events        AS events,
+                   r.filters       AS filters
+            """,
+            source_id=source_id,
+            target_id=target_id,
+        )
+        return [record.data() for record in rows]
+
+
 def get_shortest_path_details(driver, node_ids: List[str]) -> List[Dict[str, Any]]:
-    """Truy vấn chính xác các mối quan hệ dọc theo đường đi Dijkstra để gộp dữ liệu."""
+    """Truy vấn chính xác các mối quan hệ dọc theo đường đi Dijkstra để gộp dữ liệu.
+
+    Không dùng LIMIT 1 ở đây vì khi một cặp node có nhiều relationship (do update type
+    hoặc do dữ liệu cũ còn sót), query trả về edge ngẫu nhiên và dẫn tới UI render đường
+    cũ hoặc bị chồng lên. Tất cả relationships giữa 2 node sẽ được lấy và render theo
+    thứ tự logic, tránh bị lệch bởi record đầu tiên.
+    """
     if not node_ids or len(node_ids) < 2:
         return []
-    
+
     results = []
     with driver.session() as session:
         for idx in range(len(node_ids) - 1):
             source_id = node_ids[idx]
             target_id = node_ids[idx + 1]
             rows = session.run("""
-                MATCH (n {id: $source_id})-[r]-(m {id: $target_id})
+                MATCH (n {id: $source_id})-[r]->(m {id: $target_id})
                 RETURN {source: startNode(r).id, target: endNode(r).id, type: type(r), cost: r.cost} as edge,
                        {id: startNode(r).id, name: startNode(r).name, label: labels(startNode(r))[0]} as source_node,
                        {id: endNode(r).id, name: endNode(r).name, label: labels(endNode(r))[0]} as target_node
-                LIMIT 1
+                ORDER BY type(r)
             """, source_id=source_id, target_id=target_id)
-            
-            record = rows.single()
-            if record:
+
+            for record in rows:
                 results.append(record.data())
     return results
 
@@ -678,7 +816,12 @@ def render_graph_preview(driver, highlighted_path: List[str] | None = None) -> N
 
     html_content = visualize_graph_with_pyvis(edges_data, highlighted_path, isolated_nodes)
     if html_content:
-        components.html(html_content, height=730, scrolling=True)
+        # Nhúng _graph_refresh_key vào HTML comment để thay đổi nội dung HTML mỗi khi
+        # graph được cập nhật → Streamlit phát hiện HTML khác và render lại iframe.
+        # (components.html() không hỗ trợ key= trong phiên bản Streamlit hiện tại)
+        _refresh_key = st.session_state.get("_graph_refresh_key", 0)
+        html_with_key = html_content + f"<!-- graph_refresh_key={_refresh_key} -->"
+        components.html(html_with_key, height=730, scrolling=True)
 
 
 def main() -> None:
@@ -821,34 +964,130 @@ def main() -> None:
                     driver = get_driver()
                     if driver and source_id and target_id:
                         try:
+                            # Tính cost từ cost_matrix.db để gán lên relationship mới.
+                            # Vá bug: trước đây create_edge() không gán cost, khiến r.cost = null.
+                            cost_dict = load_cost_dictionary(os.path.join(BASE_DIR, "cost_matrix.db"))
+                            edge_cost = cost_dict.get(rel_type)
                             with driver.session() as session:
-                                session.execute_write(create_edge, source_id, target_id, rel_type)
+                                session.execute_write(create_edge, source_id, target_id, rel_type, edge_cost)
                             st.session_state.highlighted_path = [source_id, target_id]
-                            logger.info("Đã tạo cạnh %s -[%s]-> %s", source_id, rel_type, target_id)
+                            logger.info("Đã tạo cạnh %s -[%s]-> %s (cost=%s)", source_id, rel_type, target_id, edge_cost)
                             st.success("Edge created!")
                         except Exception as e:
                             logger.exception("Tạo cạnh %s -[%s]-> %s thất bại", source_id, rel_type, target_id)
                             st.error(f"Create failed: {e}")
             
             elif edge_action == "Update":
-                st.markdown("#### Update Edge Techniques")
+                st.markdown("#### Update Edge")
+                # Hiển thị success message từ lần Update trước (sau st.rerun)
+                if "_ue_success" in st.session_state:
+                    st.success(st.session_state.pop("_ue_success"))
+
                 source_id = st.text_input("Source ID", key="edge_source_update")
                 target_id = st.text_input("Target ID", key="edge_target_update")
-                rel_type = st.selectbox("Relationship Type", options=EDGE_TYPE_OPTIONS, key="edge_type_update")
-                techniques = st.text_area("Techniques (comma-separated)", key="edge_techniques")
+                rel_type = st.selectbox(
+                    "Relationship Type",
+                    options=EDGE_TYPE_OPTIONS,
+                    key="edge_type_update",
+                )
+                techniques = st.text_area(
+                    "Techniques (comma-separated, để trống nếu không đổi)",
+                    key="edge_techniques",
+                )
+
                 if st.button("Update Edge", key="update_edge_btn"):
                     driver = get_driver()
-                    if driver and source_id and target_id and techniques:
+                    if not (driver and source_id and target_id):
+                        st.warning("Nhập đủ Source ID, Target ID và kết nối Neo4j.")
+                    else:
                         try:
-                            tech_list = [t.strip() for t in techniques.split(",")]
-                            with driver.session() as session:
-                                session.execute_write(set_edge_techniques, source_id, target_id, tech_list, rel_type)
-                            st.session_state.highlighted_path = [source_id, target_id]
-                            logger.info("Đã cập nhật techniques cho cạnh %s -[%s]-> %s", source_id, rel_type, target_id)
-                            st.success("Edge updated!")
+                            # Auto-detect type hiện tại trong Neo4j (không cần Load Edge).
+                            # Đây là cách duy nhất biết old_type chính xác để đổi type.
+                            current_edges = get_edge_info(driver, source_id, target_id)
+                            if not current_edges:
+                                st.error(
+                                    f"Không tìm thấy edge nào: {source_id} → {target_id}. "
+                                    "Kiểm tra lại Source ID và Target ID."
+                                )
+                            else:
+                                _old_type = current_edges[0]["type"]
+                                type_changed = rel_type != _old_type
+                                _success_parts: List[str] = []
+
+                                if type_changed:
+                                    # Đổi type: xóa relationship cũ, tạo lại với type mới,
+                                    # giữ nguyên properties, tính lại cost từ SQLite.
+                                    cost_dict = load_cost_dictionary(
+                                        os.path.join(BASE_DIR, "cost_matrix.db")
+                                    )
+                                    new_cost = cost_dict.get(rel_type)
+                                    with driver.session() as session:
+                                        session.execute_write(
+                                            change_edge_type,
+                                            source_id, target_id,
+                                            _old_type, rel_type,
+                                            new_cost,
+                                        )
+                                    logger.info(
+                                        "Đã đổi type cạnh %s: [%s] → [%s] (cost=%s)",
+                                        source_id, _old_type, rel_type, new_cost,
+                                    )
+                                    _success_parts.append(
+                                        f"Type: [{_old_type}] → [{rel_type}] | cost = {new_cost}"
+                                    )
+
+                                if techniques.strip():
+                                    tech_list = [
+                                        t.strip() for t in techniques.split(",") if t.strip()
+                                    ]
+                                    with driver.session() as session:
+                                        session.execute_write(
+                                            set_edge_techniques,
+                                            source_id, target_id, tech_list, rel_type,
+                                        )
+                                    logger.info(
+                                        "Đã cập nhật techniques cho cạnh %s -[%s]-> %s",
+                                        source_id, rel_type, target_id,
+                                    )
+                                    _success_parts.append(
+                                        f"Techniques: {tech_list}"
+                                    )
+
+                                if not _success_parts:
+                                    st.warning(
+                                        f"Edge hiện tại đã là [{_old_type}] và không có "
+                                        "Techniques mới — không có thay đổi nào."
+                                    )
+                                else:
+                                    # Set các giá trị để sau rerun:
+                                    # - _ue_success: hiển thị success message
+                                    # - edge_type_update: form cập nhật đúng type mới
+                                    # - highlighted_path: xóa để graph dùng get_graph_preview()
+                                    #   trực tiếp, không merge path cũ — graph hiển edge mới
+                                    # - _graph_refresh_key: buộc pyvis render lại HTML mới
+                                    st.session_state["_ue_success"] = (
+                                        "Edge updated! " + " | ".join(_success_parts)
+                                    )
+                                    # Không ghi lại key widget đã được tạo, vì Streamlit sẽ báo
+                                    # "cannot be modified after the widget with key ... is instantiated".
+                                    # Việc này không cần thiết để giữ selection; widget sẽ được
+                                    # khởi tạo lại ở lần render tiếp theo với giá trị mặc định hợp lệ.
+                                    st.session_state.highlighted_path = []
+                                    st.session_state["_graph_refresh_key"] = (
+                                        st.session_state.get("_graph_refresh_key", 0) + 1
+                                    )
+                                    st.rerun()
+
+                        except ValueError as e:
+                            logger.warning("Cập nhật cạnh thất bại (không tìm thấy): %s", e)
+                            st.error(f"Edge not found: {e}")
                         except Exception as e:
-                            logger.exception("Cập nhật cạnh %s -[%s]-> %s thất bại", source_id, rel_type, target_id)
+                            logger.exception(
+                                "Cập nhật cạnh %s -[%s]-> %s thất bại",
+                                source_id, rel_type, target_id,
+                            )
                             st.error(f"Update failed: {e}")
+
             
             elif edge_action == "Delete":
                 st.markdown("#### Delete Edge")
